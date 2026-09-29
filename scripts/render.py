@@ -56,8 +56,8 @@ LANDMARKS = [
     (30.3238, 59.9700), (30.3562, 59.9219), (30.2744, 59.9008), (30.3413, 59.9154),
     (30.2095, 59.9535), (30.3558, 59.9557), (30.2961, 59.9257),
 ]
-DOT_SPACING = 24.0       # min distance between dots, px
-LANDMARK_SPACING = 34.0  # keep small dots a bit further from the big ones
+DOT_SPACING = 37.5       # min distance between dots, px
+LANDMARK_SPACING = 40.0  # keep small dots a bit further from the big ones
 DOT_AREA = (16, 292, SIZE - 16, SIZE - 16)   # below the title veil
 CREDIT_BOX = (SIZE - 232, SIZE - 44)         # no dots under the credit
 
@@ -147,7 +147,7 @@ CREDIT_TEXT = '© OpenStreetMap contributors'   # ODbL attribution for the map d
 TITLE_SIZE = 70
 TITLE_BASELINE = 128
 FADE_SOLID, FADE_END = 150, 285  # white veil under the title (px)
-FLASH_RISE, FLASH_FALL = 0.10, 0.36   # seconds
+BLINK_OUT, BLINK_OFF, BLINK_IN = 0.10, 0.16, 0.10   # seconds: fade out, stay dark, come back
 
 # ---------------------------------------------------------------- scene
 class Scene:
@@ -199,7 +199,7 @@ class Scene:
                 d['kind'] = 'mid'
         # rhythm: whole number of flashes per loop -> seamless
         for d in dots:
-            cycles = {'big': (1, 2), 'mid': (2, 3), 'small': (2, 3, 4, 5)}[d['kind']]
+            cycles = {'big': (1, 2), 'mid': (2, 3), 'small': (2, 3, 4)}[d['kind']]
             d['n'] = int(rng.choice(cycles))
             d['phase'] = float(rng.random())
         return dots
@@ -236,48 +236,52 @@ class Scene:
 
     # ---- one dot at loop time t
     def draw_dot(self, c, d, t, paints):
-        """A dot rests, then flashes: quick rise, softer fall, a wave rolls out.
+        """A dot is lit, blinks off for a moment and comes back with a small pop.
 
-        Between flashes the dot is perfectly still, which keeps the GIF small.
+        Between blinks the dot is perfectly still, which keeps the GIF small.
         """
         fill, ring, glow = paints
         x, y, kind = d['x'], d['y'], d['kind']
         period = LOOP / d['n']
-        cyc = d['n'] * t / LOOP - d['phase']          # a flash at every whole cyc
-        since = (cyc % 1.0) * period                  # seconds since the last flash
-        until = period - since                        # seconds to the next one
-        if until < FLASH_RISE:
-            e = math.sin(0.5 * math.pi * (1 - until / FLASH_RISE)) ** 2
-        elif since < FLASH_FALL:
-            e = math.cos(0.5 * math.pi * since / FLASH_FALL) ** 2
+        cyc = d['n'] * t / LOOP - d['phase']
+        since = (cyc % 1.0) * period                  # seconds since this blink began
+        dark = BLINK_OUT + BLINK_OFF
+        if since < BLINK_OUT:
+            v = math.cos(0.5 * math.pi * since / BLINK_OUT) ** 2
+        elif since < dark:
+            v = 0.0
+        elif since < dark + BLINK_IN:
+            v = math.sin(0.5 * math.pi * (since - dark) / BLINK_IN) ** 2
         else:
-            e = 0.0
+            v = 1.0
+        back = since - dark                           # seconds since it started coming back
+        pop = 1.0 + 0.30 * math.exp(-((back - 0.12) / 0.09) ** 2) if back > 0 else 1.0
 
         r0 = {'big': 6.6, 'mid': 4.6, 'small': 3.6}[kind]
-        if kind != 'small':
-            life, reach = (1.5, 46.0) if kind == 'big' else (1.0, 22.0)
-            waves = (0.0, 0.28) if kind == 'big' else (0.0,)
+        if kind != 'small' and back > 0:
+            life, reach = (1.3, 42.0) if kind == 'big' else (0.9, 18.0)
+            waves = (0.0, 0.25) if kind == 'big' else (0.0,)
             for delay in waves:
-                q = (since - delay) / life
+                q = (back - delay) / life
                 if not 0.0 < q < 1.0:
                     continue
                 rr = r0 + reach * ease_out_cubic(q)
                 a = (1.0 - q) ** 2
                 if kind == 'big' and delay == 0.0:
-                    fill.setColor(color4(RED, 0.14 * a))
+                    fill.setColor(color4(RED, 0.12 * a))
                     c.drawCircle(x, y, rr, fill)
-                ring.setStrokeWidth(1.6 if kind == 'big' else 1.3)
-                ring.setColor(color4(RED, 0.70 * a))
+                ring.setStrokeWidth(1.5 if kind == 'big' else 1.2)
+                ring.setColor(color4(RED, 0.65 * a))
                 c.drawCircle(x, y, rr, ring)
 
-        if e > 0.0:   # bloom
-            glow.setColor(color4(RED, 0.62 * e))
-            c.drawCircle(x, y, r0 * (1.3 + 1.7 * e), glow)
-        k = 0.80 + 0.64 * e
-        a = 0.68 + 0.32 * e
-        fill.setColor(color4((255, 255, 255), 1.0))
+        if v <= 0.0:
+            return
+        k = pop * (0.55 + 0.45 * v)
+        glow.setColor(color4(RED, 0.22 * v))
+        c.drawCircle(x, y, r0 * 2.0 * k, glow)
+        fill.setColor(color4((255, 255, 255), v))
         c.drawCircle(x, y, (r0 + 1.5) * k, fill)
-        fill.setColor(color4(RED, a))
+        fill.setColor(color4(RED, v))
         c.drawCircle(x, y, r0 * k, fill)
 
     def draw(self, c, t, size):
