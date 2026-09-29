@@ -20,7 +20,7 @@ FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 SIZE = 1080            # output px (square)
 SS = 2                 # supersampling factor
 FPS = 60
-LOOP = 4.0             # seconds, one seamless cycle
+LOOP = 6.0             # seconds, one seamless cycle
 R = 6378137.0
 
 CENTER = (30.307, 59.9512)   # lon, lat of the frame centre
@@ -53,12 +53,11 @@ LANDMARKS = [
     (30.3159, 59.9391), (30.3062, 59.9341), (30.3288, 59.9400), (30.3165, 59.9502),
     (30.2892, 59.9290), (30.3957, 59.9490), (30.2207, 59.9729), (30.3355, 59.9446),
     (30.3880, 59.9213), (30.2415, 59.9247), (30.3710, 59.9460), (30.2513, 59.9318),
-    (30.3238, 59.9700), (30.3562, 59.9219), (30.2744, 59.9008), (30.3413, 59.9154),
-    (30.2095, 59.9535), (30.3558, 59.9557), (30.2961, 59.9257),
 ]
 DOT_SPACING = 37.5       # min distance between dots, px
+DOT_COUNT = 110          # dots in total; extra ones are thinned out at random
 LANDMARK_SPACING = 40.0  # keep small dots a bit further from the big ones
-DOT_AREA = (16, 292, SIZE - 16, SIZE - 16)   # below the title veil
+DOT_AREA = (16, 208, SIZE - 16, SIZE - 16)   # below the title
 CREDIT_BOX = (SIZE - 232, SIZE - 44)         # no dots under the credit
 
 # ---------------------------------------------------------------- map paths
@@ -144,10 +143,12 @@ def color4(rgb, a):
 
 TITLE_TEXT = 'Лучшие места города'
 CREDIT_TEXT = '© OpenStreetMap contributors'   # ODbL attribution for the map data
-TITLE_SIZE = 70
-TITLE_BASELINE = 128
-FADE_SOLID, FADE_END = 150, 285  # white veil under the title (px)
-BLINK_OUT, BLINK_OFF, BLINK_IN = 0.10, 0.16, 0.10   # seconds: fade out, stay dark, come back
+TITLE_SIZE = 76
+TITLE_BASELINE = 112
+TITLE_ALIGN = 'center'   # or 'left'
+TITLE_MARGIN = 56        # left margin when left-aligned
+FADE_SOLID, FADE_END = 146, 196  # white band under the title, then a short fade into the map (px)
+BLINK_OUT, BLINK_OFF, BLINK_IN = 0.25, 0.30, 0.25   # seconds: fade out, stay dark, come back
 
 # ---------------------------------------------------------------- scene
 class Scene:
@@ -193,13 +194,18 @@ class Scene:
             if ok(x, y) and not near(x, y, DOT_SPACING):
                 dots.append(dict(x=float(x), y=float(y), kind='small'))
                 add(x, y, DOT_SPACING)
+        # thin out at random, keeping the landmarks: the centre stays denser
+        big = [d for d in dots if d['kind'] == 'big']
+        rest = [d for d in dots if d['kind'] != 'big']
+        keep = sorted(rng.permutation(len(rest))[:max(0, DOT_COUNT - len(big))])
+        dots = big + [rest[i] for i in keep]
         # a quarter of the small dots become medium ones with their own waves
         for d in dots:
             if d['kind'] == 'small' and rng.random() < 0.25:
                 d['kind'] = 'mid'
         # rhythm: whole number of flashes per loop -> seamless
         for d in dots:
-            cycles = {'big': (1, 2), 'mid': (2, 3), 'small': (2, 3, 4)}[d['kind']]
+            cycles = {'big': (1,), 'mid': (1, 2), 'small': (1, 1, 2)}[d['kind']]
             d['n'] = int(rng.choice(cycles))
             d['phase'] = float(rng.random())
         return dots
@@ -225,7 +231,8 @@ class Scene:
                 [0.0, FADE_SOLID / FADE_END, 1.0]))
             c.drawRect(skia.Rect(0, 0, SIZE, FADE_END), g)
             title = Title('fonts/InterDisplay-700-cyr.ttf', TITLE_TEXT, TITLE_SIZE, tracking=-0.012)
-            title.draw(c, (SIZE - title.width) / 2, TITLE_BASELINE, skia.Paint(AntiAlias=True, Color=skia.Color(*INK)))
+            tx = TITLE_MARGIN if TITLE_ALIGN == 'left' else (SIZE - title.width) / 2
+            title.draw(c, tx, TITLE_BASELINE, skia.Paint(AntiAlias=True, Color=skia.Color(*INK)))
             credit = Title('fonts/Inter-400-latin.ttf', CREDIT_TEXT, 13, tracking=0.005)
             w = credit.width
             xr, yb = SIZE - 14, SIZE - 12
@@ -255,12 +262,12 @@ class Scene:
         else:
             v = 1.0
         back = since - dark                           # seconds since it started coming back
-        pop = 1.0 + 0.30 * math.exp(-((back - 0.12) / 0.09) ** 2) if back > 0 else 1.0
+        pop = 1.0 + 0.22 * math.exp(-((back - 0.20) / 0.14) ** 2) if back > 0 else 1.0
 
         r0 = {'big': 6.6, 'mid': 4.6, 'small': 3.6}[kind]
         if kind != 'small' and back > 0:
-            life, reach = (1.3, 42.0) if kind == 'big' else (0.9, 18.0)
-            waves = (0.0, 0.25) if kind == 'big' else (0.0,)
+            life, reach = (1.8, 42.0) if kind == 'big' else (1.3, 18.0)
+            waves = (0.0, 0.35) if kind == 'big' else (0.0,)
             for delay in waves:
                 q = (back - delay) / life
                 if not 0.0 < q < 1.0:
