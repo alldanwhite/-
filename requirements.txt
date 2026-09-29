@@ -1,0 +1,8 @@
+pyarrow>=17
+shapely>=2.0
+numpy
+skia-python>=138
+uharfbuzz
+fonttools
+brotli
+imageio-ffmpeg
