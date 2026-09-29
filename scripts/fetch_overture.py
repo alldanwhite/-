@@ -6,6 +6,7 @@ that intersect our area are read.
 
     python scripts/fetch_overture.py segment   # roads   -> data/segment.parquet
     python scripts/fetch_overture.py water     # water   -> data/water.parquet
+    python scripts/fetch_overture.py place     # POIs    -> data/place.parquet
 """
 import os, sys, time, concurrent.futures as cf
 import pyarrow as pa, pyarrow.fs as fs, pyarrow.parquet as pq, pyarrow.compute as pc
@@ -16,6 +17,7 @@ BBOX = (30.08, 59.84, 30.52, 60.05)  # xmin, ymin, xmax, ymax (lon/lat)
 LAYERS = {
     'segment': ('transportation', 'segment', ['id', 'subtype', 'class', 'subclass', 'road_flags', 'geometry', 'bbox']),
     'water':   ('base', 'water', ['id', 'subtype', 'class', 'is_salt', 'names', 'geometry', 'bbox']),
+    'place':   ('places', 'place', ['id', 'names', 'basic_category', 'confidence', 'geometry', 'bbox']),
 }
 
 s3 = fs.S3FileSystem(anonymous=True, region='us-west-2')

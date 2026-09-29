@@ -1,14 +1,18 @@
-"""Render the 'Лучшие места города' Saint Petersburg map animation.
+"""Render the 'Лучшие места города' Saint Petersburg map as a seamless loop.
 
-    python scripts/render.py video video/spb_best_places.mp4 [--crf=19] [--range=4:6]
-    python scripts/render.py still 7.0 frame.png [--labels]
-    python scripts/render.py sheet 0.5,2,6,11.9 sheet.png [--labels]
+    python scripts/render.py video video/spb_best_places.mp4 [--crf=17]
+    python scripts/render.py gif   video/spb_best_places.gif [--size=720] [--fps=25] [--colors=128]
+    python scripts/render.py still 2.0 frame.png
+    python scripts/render.py sheet 0,1,2,3,4,5 sheet.png
 
 Run from the repository root (reads data/prepared.pkl and fonts/).
+The map is static; every dot twinkles a whole number of times per LOOP
+seconds, so the last frame flows straight into the first one.
 """
-import math, pickle, sys, subprocess, time
+import math, os, pickle, shutil, sys, subprocess, time
 import multiprocessing as mp
 import numpy as np, skia, uharfbuzz as hb
+import shapely
 import imageio_ffmpeg
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -16,11 +20,11 @@ FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 SIZE = 1080            # output px (square)
 SS = 2                 # supersampling factor
 FPS = 60
-DURATION = 12.0        # seconds
+LOOP = 4.0             # seconds, one seamless cycle
 R = 6378137.0
 
-CENTER = (30.307, 59.9512)   # lon, lat of the base frame centre
-GROUND_W = 14200.0          # ground metres across the base frame
+CENTER = (30.307, 59.9512)   # lon, lat of the frame centre
+GROUND_W = 14200.0          # ground metres across the frame
 
 WHITE = skia.Color(255, 255, 255)
 INK = (10, 10, 10)
@@ -42,27 +46,20 @@ def lonlat_px(lon, lat):
     x, y = merc(lon, lat)
     return (x - CX) * K + SIZE / 2, (CY - y) * K + SIZE / 2
 
-# ---------------------------------------------------------------- places
-PLACES = [  # name, lon, lat, major
-    ('Дворцовая площадь',        30.3159, 59.9391, False),
-    ('Исаакиевский собор',       30.3062, 59.9341, False),
-    ('Спас на Крови',            30.3288, 59.9400, False),
-    ('Петропавловская крепость', 30.3165, 59.9502, True),
-    ('Новая Голландия',          30.2892, 59.9290, True),
-    ('Смольный собор',           30.3957, 59.9490, False),
-    ('Газпром Арена',            30.2207, 59.9729, True),
-    ('Летний сад',               30.3355, 59.9446, False),
-    ('Александро-Невская лавра', 30.3880, 59.9213, False),
-    ('Севкабель Порт',           30.2415, 59.9247, True),
-    ('Таврический сад',          30.3710, 59.9460, False),
-    ('Эрарта',                   30.2513, 59.9318, False),
-    ('Аптекарский огород',       30.3238, 59.9700, False),
-    ('Лофт Проект Этажи',        30.3562, 59.9219, False),
-    ('Нарвские ворота',          30.2744, 59.9008, False),
-    ('Ткачи',                    30.3413, 59.9154, False),
-    ('Морской фасад',            30.2095, 59.9535, False),
-    ('Финляндский вокзал',       30.3558, 59.9557, False),
+# ---------------------------------------------------------------- dots
+# landmarks get the big dots with wide waves; the rest of the dots sit on real
+# cafes, bars, museums, galleries, theatres, parks... (Overture places)
+LANDMARKS = [
+    (30.3159, 59.9391), (30.3062, 59.9341), (30.3288, 59.9400), (30.3165, 59.9502),
+    (30.2892, 59.9290), (30.3957, 59.9490), (30.2207, 59.9729), (30.3355, 59.9446),
+    (30.3880, 59.9213), (30.2415, 59.9247), (30.3710, 59.9460), (30.2513, 59.9318),
+    (30.3238, 59.9700), (30.3562, 59.9219), (30.2744, 59.9008), (30.3413, 59.9154),
+    (30.2095, 59.9535), (30.3558, 59.9557), (30.2961, 59.9257),
 ]
+DOT_SPACING = 24.0       # min distance between dots, px
+LANDMARK_SPACING = 34.0  # keep small dots a bit further from the big ones
+DOT_AREA = (16, 292, SIZE - 16, SIZE - 16)   # below the title veil
+CREDIT_BOX = (SIZE - 232, SIZE - 44)         # no dots under the credit
 
 # ---------------------------------------------------------------- map paths
 ROAD_STYLE = [  # class, width (base px), alpha
@@ -100,16 +97,27 @@ def build_paths(data):
         water.addPoly([skia.Point(float(x), float(y)) for x, y in q], True)
     return roads, water
 
+def water_shape(data):
+    """Water as a shapely geometry in frame px, to keep dots on land."""
+    rings = [to_px(r) for r in data['water']]
+    polys = [shapely.Polygon(r) for r in rings if len(r) >= 4]
+    polys = [p if p.is_valid else p.buffer(0) for p in polys]
+    # even-odd rings: xor them together (islands inside rivers stay land)
+    acc = shapely.Polygon()
+    for p in polys:
+        acc = shapely.symmetric_difference(acc, p)
+    shapely.prepare(acc)
+    return acc
+
 # ---------------------------------------------------------------- text
 class Title:
     def __init__(self, font_path, text, size, tracking=0.0):
         blob = hb.Blob.from_file_path(font_path)
         face = hb.Face(blob)
         font = hb.Font(face)
-        upem = face.upem
         buf = hb.Buffer(); buf.add_str(text); buf.guess_segment_properties()
         hb.shape(font, buf, {'kern': True, 'liga': True})
-        scale = size / upem
+        scale = size / face.upem
         self.glyphs, self.pos = [], []
         x = 0.0
         for info, p in zip(buf.glyph_infos, buf.glyph_positions):
@@ -117,8 +125,7 @@ class Title:
             self.pos.append((x + p.x_offset * scale, -p.y_offset * scale))
             x += p.x_advance * scale + tracking * size
         self.width = x - tracking * size
-        tf = skia.Typeface.MakeFromFile(font_path)
-        self.font = skia.Font(tf, size)
+        self.font = skia.Font(skia.Typeface.MakeFromFile(font_path), size)
         self.font.setEdging(skia.Font.Edging.kAntiAlias)
         self.font.setSubpixel(True)
         self.font.setHinting(skia.FontHinting.kNone)
@@ -128,267 +135,249 @@ class Title:
         builder.allocRunPos(self.font, self.glyphs, [skia.Point(px, py) for px, py in self.pos])
         canvas.drawTextBlob(builder.make(), x, y, paint)
 
-# ---------------------------------------------------------------- easing
+# ---------------------------------------------------------------- helpers
 def clamp(v, a=0.0, b=1.0): return a if v < a else b if v > b else v
-def smooth(t): t = clamp(t); return t * t * (3 - 2 * t)
 def ease_out_cubic(t): t = clamp(t); return 1 - (1 - t) ** 3
-def ease_in_out_sine(t): t = clamp(t); return 0.5 - 0.5 * math.cos(math.pi * t)
-def ease_out_back(t, s=1.7): t = clamp(t) - 1; return 1 + t * t * ((s + 1) * t + s)
 
-# ---------------------------------------------------------------- scene
-FOCUS = (30.312, 59.9395)       # camera push-in target
-REVEAL_T = 2.6
-# moments when one place 'lights up' with a big double wave
-BURSTS = [(5.0, 'Новая Голландия'), (7.2, 'Дворцовая площадь'), (9.3, 'Севкабель Порт'), (10.2, 'Смольный собор')]
-BURST_T = 1.7
+def color4(rgb, a):
+    return skia.Color4f(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255, a)
+
 TITLE_TEXT = 'Лучшие места города'
 CREDIT_TEXT = '© OpenStreetMap contributors'   # ODbL attribution for the map data
 TITLE_SIZE = 70
 TITLE_BASELINE = 128
 FADE_SOLID, FADE_END = 150, 285  # white veil under the title (px)
+FLASH_RISE, FLASH_FALL = 0.10, 0.36   # seconds
 
-def color4(rgb, a):
-    return skia.Color4f(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255, a)
-
+# ---------------------------------------------------------------- scene
 class Scene:
-    def __init__(self, data, font_path, debug_labels=False):
-        self.roads, self.water = build_paths(data)
-        self.title = Title(font_path, TITLE_TEXT, TITLE_SIZE, tracking=-0.012)
-        self.credit = Title('fonts/Inter-400-latin.ttf', CREDIT_TEXT, 13, tracking=0.005)
-        self.debug_labels = debug_labels
-        self.focus = lonlat_px(*FOCUS)
-        rng = np.random.default_rng(7)
-        order = rng.permutation(len(PLACES))
-        self.dots = []
-        for k, idx in enumerate(order):
-            name, lo, la, major = PLACES[idx]
+    def __init__(self, data):
+        self.data = data
+        self.dots = self.pick_dots(data)
+        self.base = self.render_base(data)
+
+    # ---- dot layout: landmarks first, then a poisson-disk pick of real places
+    def pick_dots(self, data):
+        rng = np.random.default_rng(11)
+        water = water_shape(data)
+        x0, y0, x1, y1 = DOT_AREA
+
+        def ok(x, y):
+            if not (x0 <= x <= x1 and y0 <= y <= y1): return False
+            if x >= CREDIT_BOX[0] and y >= CREDIT_BOX[1]: return False
+            return not shapely.contains_xy(water, x, y)
+
+        cell = DOT_SPACING
+        grid = {}
+        def near(x, y, d):
+            gx, gy = int(x // cell), int(y // cell)
+            r = int(math.ceil(d / cell))
+            for i in range(gx - r, gx + r + 1):
+                for j in range(gy - r, gy + r + 1):
+                    for (px, py, pd) in grid.get((i, j), ()):
+                        if (px - x) ** 2 + (py - y) ** 2 < max(d, pd) ** 2:
+                            return True
+            return False
+        def add(x, y, d):
+            grid.setdefault((int(x // cell), int(y // cell)), []).append((x, y, d))
+
+        dots = []
+        for lo, la in LANDMARKS:
             x, y = lonlat_px(lo, la)
-            self.dots.append(dict(
-                name=name, x=x, y=y, major=major,
-                appear=1.25 + 0.16 * k,                  # staggered pop-in
-                period=float(rng.uniform(2.1, 3.0)),     # own rhythm per dot
-                phase=float(rng.uniform(0.0, 1.0)),
-            ))
+            if ok(x, y):
+                dots.append(dict(x=x, y=y, kind='big'))
+                add(x, y, LANDMARK_SPACING)
+        pts = to_px(data['pois'])
+        for k in rng.permutation(len(pts)):
+            x, y = pts[k]
+            if ok(x, y) and not near(x, y, DOT_SPACING):
+                dots.append(dict(x=float(x), y=float(y), kind='small'))
+                add(x, y, DOT_SPACING)
+        # a quarter of the small dots become medium ones with their own waves
+        for d in dots:
+            if d['kind'] == 'small' and rng.random() < 0.25:
+                d['kind'] = 'mid'
+        # rhythm: whole number of flashes per loop -> seamless
+        for d in dots:
+            cycles = {'big': (1, 2), 'mid': (2, 3), 'small': (2, 3, 4, 5)}[d['kind']]
+            d['n'] = int(rng.choice(cycles))
+            d['phase'] = float(rng.random())
+        return dots
 
-    # camera: slow continuous push-in, zoom 1.00 -> 1.12
-    def camera(self, t):
-        return 1.0 + 0.12 * ease_in_out_sine(t / DURATION)
+    # ---- static layer: map, title veil, title, credit (drawn once at SSx)
+    def render_base(self, data):
+        roads, water = build_paths(data)
+        surf = skia.Surface(SIZE * SS, SIZE * SS)
+        with surf as c:
+            c.clear(WHITE)
+            c.scale(SS, SS)
+            c.drawPath(water, skia.Paint(AntiAlias=True, Color=WATER))
+            sp = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style,
+                            StrokeCap=skia.Paint.kRound_Cap, StrokeJoin=skia.Paint.kRound_Join)
+            for cls, w, a in ROAD_STYLE:
+                sp.setStrokeWidth(w)
+                sp.setColor(color4(INK, a))
+                c.drawPath(roads[cls], sp)
+            g = skia.Paint()
+            g.setShader(skia.GradientShader.MakeLinear(
+                [skia.Point(0, 0), skia.Point(0, FADE_END)],
+                [color4((255, 255, 255), 1), color4((255, 255, 255), 1), color4((255, 255, 255), 0)],
+                [0.0, FADE_SOLID / FADE_END, 1.0]))
+            c.drawRect(skia.Rect(0, 0, SIZE, FADE_END), g)
+            title = Title('fonts/InterDisplay-700-cyr.ttf', TITLE_TEXT, TITLE_SIZE, tracking=-0.012)
+            title.draw(c, (SIZE - title.width) / 2, TITLE_BASELINE, skia.Paint(AntiAlias=True, Color=skia.Color(*INK)))
+            credit = Title('fonts/Inter-400-latin.ttf', CREDIT_TEXT, 13, tracking=0.005)
+            w = credit.width
+            xr, yb = SIZE - 14, SIZE - 12
+            c.drawRRect(skia.RRect.MakeRectXY(skia.Rect(xr - w - 14, yb - 21, xr, yb), 6, 6),
+                        skia.Paint(AntiAlias=True, Color4f=color4((255, 255, 255), 0.88)))
+            credit.draw(c, xr - w - 7, yb - 6.5, skia.Paint(AntiAlias=True, Color4f=color4((120, 120, 120), 1)))
+        return surf.makeImageSnapshot()
 
-    def to_screen(self, x, y, z):
-        fx, fy = self.focus
-        return fx + (x - fx) * z, fy + (y - fy) * z
+    # ---- one dot at loop time t
+    def draw_dot(self, c, d, t, paints):
+        """A dot rests, then flashes: quick rise, softer fall, a wave rolls out.
 
-    def draw_map(self, canvas, z):
-        fx, fy = self.focus
-        canvas.save()
-        canvas.translate(fx, fy); canvas.scale(z, z); canvas.translate(-fx, -fy)
-        paint = skia.Paint(AntiAlias=True, Color=WATER)
-        canvas.drawPath(self.water, paint)
-        sp = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style,
-                        StrokeCap=skia.Paint.kRound_Cap, StrokeJoin=skia.Paint.kRound_Join)
-        for cls, w, a in ROAD_STYLE:
-            sp.setStrokeWidth(w)
-            sp.setColor(color4(INK, a))
-            canvas.drawPath(self.roads[cls], sp)
-        canvas.restore()
+        Between flashes the dot is perfectly still, which keeps the GIF small.
+        """
+        fill, ring, glow = paints
+        x, y, kind = d['x'], d['y'], d['kind']
+        period = LOOP / d['n']
+        cyc = d['n'] * t / LOOP - d['phase']          # a flash at every whole cyc
+        since = (cyc % 1.0) * period                  # seconds since the last flash
+        until = period - since                        # seconds to the next one
+        if until < FLASH_RISE:
+            e = math.sin(0.5 * math.pi * (1 - until / FLASH_RISE)) ** 2
+        elif since < FLASH_FALL:
+            e = math.cos(0.5 * math.pi * since / FLASH_FALL) ** 2
+        else:
+            e = 0.0
 
-    def draw_reveal_mask(self, canvas, t):
-        # radial reveal from the focus point during the intro
-        u = ease_in_out_sine(t / REVEAL_T)
-        if u >= 1.0:
-            return
-        fx, fy = self.focus
-        feather = 260.0
-        rad = 110 + u * (1080 + feather)
-        inner = max(rad - feather, 0.0)
-        g = skia.GradientShader.MakeRadial(
-            skia.Point(fx, fy), rad,
-            [color4((0, 0, 0), 1.0), color4((0, 0, 0), 1.0), color4((0, 0, 0), 0.0)],
-            [0.0, inner / rad, 1.0])
-        p = skia.Paint(Shader=g, BlendMode=skia.BlendMode.kDstIn)
-        canvas.drawRect(skia.Rect(0, 0, SIZE, SIZE), p)
+        r0 = {'big': 6.6, 'mid': 4.6, 'small': 3.6}[kind]
+        if kind != 'small':
+            life, reach = (1.5, 46.0) if kind == 'big' else (1.0, 22.0)
+            waves = (0.0, 0.28) if kind == 'big' else (0.0,)
+            for delay in waves:
+                q = (since - delay) / life
+                if not 0.0 < q < 1.0:
+                    continue
+                rr = r0 + reach * ease_out_cubic(q)
+                a = (1.0 - q) ** 2
+                if kind == 'big' and delay == 0.0:
+                    fill.setColor(color4(RED, 0.14 * a))
+                    c.drawCircle(x, y, rr, fill)
+                ring.setStrokeWidth(1.6 if kind == 'big' else 1.3)
+                ring.setColor(color4(RED, 0.70 * a))
+                c.drawCircle(x, y, rr, ring)
 
-    def draw_dot(self, canvas, d, t, z):
-        age = t - d['appear']
-        if age <= 0:
-            return
-        x, y = self.to_screen(d['x'], d['y'], z)
-        major = d['major']
-        r0 = 7.0 if major else 5.5          # red core radius
-        rmax = 46.0 if major else 32.0      # ripple reach
-        ring_w = 2.2 if major else 1.8      # white outline
-        pop = ease_out_back(age / 0.55, 2.2)
-        vis = smooth(age / 0.18)
+        if e > 0.0:   # bloom
+            glow.setColor(color4(RED, 0.62 * e))
+            c.drawCircle(x, y, r0 * (1.3 + 1.7 * e), glow)
+        k = 0.80 + 0.64 * e
+        a = 0.68 + 0.32 * e
+        fill.setColor(color4((255, 255, 255), 1.0))
+        c.drawCircle(x, y, (r0 + 1.5) * k, fill)
+        fill.setColor(color4(RED, a))
+        c.drawCircle(x, y, r0 * k, fill)
 
-        p = skia.Paint(AntiAlias=True)
-        ps = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=1.5)
-        # ripples: two waves per cycle (half a period apart); the first one
-        # starts exactly at pop-in, so the motion is continuous
-        period = d['period']
-        for k in range(2):
-            ak = age - 0.5 * k * period
-            if ak <= 0: continue
-            ph = (ak / period) % 1.0
-            rr = r0 + (rmax - r0) * ease_out_cubic(ph)
-            a = (1.0 - ph) ** 2
-            p.setColor(color4(RED, 0.16 * a * vis))
-            canvas.drawCircle(x, y, rr, p)
-            ps.setColor(color4(RED, 0.60 * a * vis))
-            canvas.drawCircle(x, y, rr, ps)
-
-        # occasional big event: a wide double wave + strong flash
-        burst = 0.0
-        for bt, bname in BURSTS:
-            if bname != d['name']: continue
-            for j in range(2):
-                q = (t - bt - 0.22 * j) / BURST_T
-                if 0.0 < q < 1.0:
-                    rr = r0 + (92.0 - r0) * ease_out_cubic(q)
-                    a = (1.0 - q) ** 1.6
-                    ps2 = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=2.0 - 0.8 * q)
-                    ps2.setColor(color4(RED, 0.75 * a))
-                    canvas.drawCircle(x, y, rr, ps2)
-                    if j == 0:
-                        p.setColor(color4(RED, 0.10 * a))
-                        canvas.drawCircle(x, y, rr, p)
-            q = (t - bt) / 0.9
-            burst = max(burst, math.exp(-((q - 0.12) / 0.16) ** 2))
-
-        # blink: the core flashes at the start of every cycle (wrap-safe)
-        ph0 = (age / period) % 1.0
-        dph = (ph0 - 0.04 + 0.5) % 1.0 - 0.5
-        flash = math.exp(-(dph / 0.07) ** 2) * smooth((age - 0.45) / 0.3)
-        flash = max(flash, 1.6 * burst)
-        glow = skia.Paint(AntiAlias=True, Color4f=color4(RED, (0.18 + 0.32 * flash) * vis))
-        glow.setMaskFilter(skia.MaskFilter.MakeBlur(skia.kNormal_BlurStyle, 5.0))
-        canvas.drawCircle(x, y, (r0 + 3.5) * pop, glow)
-
-        s = pop * (1.0 + 0.16 * flash)
-        p.setColor(color4((255, 255, 255), vis))
-        canvas.drawCircle(x, y, (r0 + ring_w) * s, p)
-        p.setColor(color4(RED, vis))
-        canvas.drawCircle(x, y, r0 * s, p)
-        if self.debug_labels:
-            lp = skia.Paint(AntiAlias=True, Color=skia.Color(0, 90, 255))
-            canvas.drawString(d['name'], x + 9, y + 4, skia.Font(skia.Typeface('DejaVu Sans'), 11), lp)
-
-    def draw_title(self, canvas, t):
-        g = skia.Paint()
-        g.setShader(skia.GradientShader.MakeLinear(
-            [skia.Point(0, 0), skia.Point(0, FADE_END)],
-            [color4((255, 255, 255), 1), color4((255, 255, 255), 1), color4((255, 255, 255), 0)],
-            [0.0, FADE_SOLID / FADE_END, 1.0]))
-        canvas.drawRect(skia.Rect(0, 0, SIZE, FADE_END), g)
-        # per-glyph fade/rise
-        x0 = (SIZE - self.title.width) / 2
-        font = self.title.font
-        for i, (gid, (gx, gy)) in enumerate(zip(self.title.glyphs, self.title.pos)):
-            u = ease_out_cubic((t - 0.35 - 0.035 * i) / 0.75)
-            if u <= 0: continue
-            p = skia.Paint(AntiAlias=True, Color4f=color4(INK, u))
-            b = skia.TextBlobBuilder()
-            b.allocRunPos(font, [gid], [skia.Point(gx, gy)])
-            canvas.drawTextBlob(b.make(), x0, TITLE_BASELINE + 14 * (1 - u), p)
-
-    def draw_credit(self, canvas, t):
-        u = smooth((t - 1.2) / 1.2)
-        if u <= 0: return
-        w = self.credit.width
-        x1, y1 = SIZE - 14, SIZE - 12
-        box = skia.RRect.MakeRectXY(skia.Rect(x1 - w - 14, y1 - 21, x1, y1), 6, 6)
-        canvas.drawRRect(box, skia.Paint(AntiAlias=True, Color4f=color4((255, 255, 255), 0.88 * u)))
-        self.credit.draw(canvas, x1 - w - 7, y1 - 6.5, skia.Paint(AntiAlias=True, Color4f=color4((120, 120, 120), u)))
-
-    def draw(self, canvas, t):
-        canvas.clear(WHITE)
-        canvas.save()
-        canvas.scale(SS, SS)
-        z = self.camera(t)
-        intro = t < REVEAL_T
-        if intro:
-            canvas.saveLayer(None, None)
-        self.draw_map(canvas, z)
-        if intro:
-            self.draw_reveal_mask(canvas, t)
-            canvas.restore()
+    def draw(self, c, t, size):
+        c.clear(WHITE)
+        c.save()
+        c.scale(size / SIZE, size / SIZE)
+        c.drawImageRect(self.base, skia.Rect(0, 0, SIZE, SIZE),
+                        skia.SamplingOptions(skia.FilterMode.kLinear, skia.MipmapMode.kLinear))
+        fill = skia.Paint(AntiAlias=True)
+        ring = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style)
+        glow = skia.Paint(AntiAlias=True)
+        glow.setMaskFilter(skia.MaskFilter.MakeBlur(skia.kNormal_BlurStyle, 3.0))
         for d in self.dots:
-            self.draw_dot(canvas, d, t, z)
-        self.draw_title(canvas, t)
-        self.draw_credit(canvas, t)
-        canvas.restore()
+            self.draw_dot(c, d, t, (fill, ring, glow))
+        c.restore()
 
-def load_scene(debug_labels=False):
+def load_scene():
     with open('data/prepared.pkl', 'rb') as f:
         data = pickle.load(f)
-    return Scene(data, 'fonts/InterDisplay-700-cyr.ttf', debug_labels)
+    return Scene(data)
 
-def render_frame(scene, t, big, small):
+def render_frame(scene, t, size, big, small):
+    """Draw at SS x size, then downsample to size."""
     with big as c:
-        scene.draw(c, t)
+        scene.draw(c, t, size * SS)
     img = big.makeImageSnapshot()
     with small as c:
-        c.drawImageRect(img, skia.Rect(0, 0, SIZE, SIZE), skia.SamplingOptions(skia.CubicResampler.Mitchell()))
+        c.drawImageRect(img, skia.Rect(0, 0, size, size), skia.SamplingOptions(skia.CubicResampler.Mitchell()))
     return small.makeImageSnapshot()
 
-
-# ---------------------------------------------------------------- parallel video
+# ---------------------------------------------------------------- parallel rendering
 WORKERS = 3
 _W = {}
 
-def _worker_init():
+def _worker_init(size):
     _W['scene'] = load_scene()
-    _W['big'], _W['small'] = skia.Surface(SIZE * SS, SIZE * SS), skia.Surface(SIZE, SIZE)
+    _W['size'] = size
+    _W['big'], _W['small'] = skia.Surface(size * SS, size * SS), skia.Surface(size, size)
 
-def _worker_frame(i):
-    img = render_frame(_W['scene'], i / FPS, _W['big'], _W['small'])
+def _worker_frame(t):
+    img = render_frame(_W['scene'], t, _W['size'], _W['big'], _W['small'])
     return img.toarray(colorType=skia.ColorType.kRGBA_8888_ColorType).tobytes()
+
+def encode(out, size, fps, codec_args):
+    n = int(round(LOOP * fps))
+    ff = subprocess.Popen([FFMPEG, '-y', '-loglevel', 'error',
+                           '-f', 'rawvideo', '-pix_fmt', 'rgba', '-s', f'{size}x{size}', '-r', str(fps), '-i', '-']
+                          + codec_args + [out], stdin=subprocess.PIPE)
+    t0 = time.time()
+    with mp.Pool(WORKERS, initializer=_worker_init, initargs=(size,)) as pool:
+        for i, buf in enumerate(pool.imap(_worker_frame, [i / fps for i in range(n)], chunksize=2)):
+            ff.stdin.write(buf)
+            if i % 120 == 0:
+                print(f'frame {i}/{n}  {time.time() - t0:.0f}s', flush=True)
+    ff.stdin.close(); ff.wait()
+
+def arg(name, default):
+    return next((a.split('=', 1)[1] for a in sys.argv if a.startswith(f'--{name}=')), default)
 
 if __name__ == '__main__':
     mode = sys.argv[1]
     t0 = time.time()
-    if mode != 'video':
-        scene = load_scene(debug_labels=('--labels' in sys.argv))
-        print('scene built', round(time.time() - t0, 2), 's', flush=True)
+    if mode in ('still', 'sheet'):
+        scene = load_scene()
+        print(f'scene built {time.time() - t0:.1f}s, {len(scene.dots)} dots', flush=True)
         big, small = skia.Surface(SIZE * SS, SIZE * SS), skia.Surface(SIZE, SIZE)
     if mode == 'still':
-        t = float(sys.argv[2]); out = sys.argv[3]
-        t1 = time.time()
-        img = render_frame(scene, t, big, small)
-        print('frame', round(time.time() - t1, 3), 's')
-        img.save(out, skia.kPNG)
+        render_frame(scene, float(sys.argv[2]), SIZE, big, small).save(sys.argv[3], skia.kPNG)
     elif mode == 'sheet':   # contact sheet of several moments
-        times = [float(v) for v in sys.argv[2].split(',')]; out = sys.argv[3]
+        times = [float(v) for v in sys.argv[2].split(',')]
         cols = 3; rows = (len(times) + cols - 1) // cols; cell = 540
         sheet = skia.Surface(cols * cell, rows * cell)
         with sheet as sc:
             sc.clear(skia.Color(128, 128, 128))
             for i, t in enumerate(times):
-                img = render_frame(scene, t, big, small)
+                img = render_frame(scene, t, SIZE, big, small)
                 sc.drawImageRect(img, skia.Rect.MakeXYWH((i % cols) * cell + 2, (i // cols) * cell + 2, cell - 4, cell - 4),
                                  skia.SamplingOptions(skia.CubicResampler.Mitchell()))
-                sc.drawString(f't={t:.2f}s', (i % cols) * cell + 10, (i // cols) * cell + 20,
-                              skia.Font(skia.Typeface('DejaVu Sans'), 14), skia.Paint(Color=skia.Color(0, 90, 255)))
-        sheet.makeImageSnapshot().save(out, skia.kPNG)
-    elif mode == 'video':
-        out = sys.argv[2]
-        crf = next((a.split('=')[1] for a in sys.argv if a.startswith('--crf=')), '19')
-        rng_arg = next((a.split('=')[1] for a in sys.argv if a.startswith('--range=')), None)
-        f0, f1 = 0, int(round(DURATION * FPS))
-        if rng_arg:   # render only part of the timeline, in seconds: --range=4:6
-            s0, s1 = (float(v) for v in rng_arg.split(':'))
-            f0, f1 = int(round(s0 * FPS)), int(round(s1 * FPS))
-        n = f1 - f0
-        ff = subprocess.Popen([
-            FFMPEG, '-y', '-loglevel', 'error',
-            '-f', 'rawvideo', '-pix_fmt', 'rgba', '-s', f'{SIZE}x{SIZE}', '-r', str(FPS), '-i', '-',
+        sheet.makeImageSnapshot().save(sys.argv[3], skia.kPNG)
+    elif mode == 'video':   # silent seamless mp4 (what messengers call a "GIF")
+        encode(sys.argv[2], SIZE, FPS, [
             '-vf', 'scale=in_range=full:out_range=tv:out_color_matrix=bt709,format=yuv420p',
-            '-c:v', 'libx264', '-preset', 'slow', '-crf', crf, '-profile:v', 'high', '-level', '4.2',
+            '-c:v', 'libx264', '-preset', 'slow', '-crf', arg('crf', '17'), '-profile:v', 'high', '-level', '4.2',
+            # keep the key frame's quality close to the other frames so the loop point doesn't pop
+            '-x264-params', 'mbtree=0:ipratio=1.0',
             '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-color_range', 'tv',
-            '-movflags', '+faststart', out], stdin=subprocess.PIPE)
-        with mp.Pool(WORKERS, initializer=_worker_init) as pool:
-            for i, buf in enumerate(pool.imap(_worker_frame, range(f0, f1), chunksize=2)):
-                ff.stdin.write(buf)
-                if i % 120 == 0:
-                    print(f'frame {i}/{n}  {time.time() - t0:.0f}s', flush=True)
-        ff.stdin.close(); ff.wait()
-        print('done', out, round(time.time() - t0, 1), 's')
+            '-an', '-movflags', '+faststart'])
+    elif mode == 'gif':     # real GIF, infinite loop, one global palette
+        size, fps = int(arg('size', '720')), int(arg('fps', '25'))
+        out = sys.argv[2]
+        raw = out + '.raw.gif'
+        encode(raw, size, fps, [
+            '-filter_complex', f'split[a][b];[a]palettegen=max_colors={arg("colors", "128")}:stats_mode=full:reserve_transparent=1[p];'
+                               '[b][p]paletteuse=dither=none:diff_mode=rectangle',
+            '-loop', '0'])
+        if shutil.which('gifsicle'):   # store only what changes between frames
+            # lossless on purpose: lossy GIF errors pile up and the loop point would jump
+            lossy = int(arg('lossy', '0'))
+            subprocess.run(['gifsicle', '-O3'] + ([f'--lossy={lossy}'] if lossy else []) + [raw, '-o', out], check=True)
+            os.remove(raw)
+        else:
+            os.replace(raw, out)
+    print('done', round(time.time() - t0, 1), 's')

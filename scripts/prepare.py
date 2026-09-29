@@ -64,6 +64,26 @@ water = shapely.clip_by_rect(water, kx0, ky0, kx1, ky1)
 out['water'] = rings_of(water)
 print('water rings', len(out['water']), 'area km2 (merc)', water.area / 1e6)
 
+# ---- points of interest (where the dots may sit) ---------------------------
+POI_CATEGORIES = {
+    'restaurant', 'bar', 'casual_eatery', 'coffee_shop', 'cafe', 'historic_site',
+    'park', 'arts_and_entertainment', 'museum', 'music_venue', 'art_gallery',
+    'theatre_venue', 'monument', 'dance_club', 'movie_theater', 'stadium_arena',
+}
+pl = pq.read_table('data/place.parquet', columns=['basic_category', 'confidence', 'geometry']).to_pylist()
+pois = []
+for r in pl:
+    if r['basic_category'] not in POI_CATEGORIES or (r['confidence'] or 0) < 0.6:
+        continue
+    g = shapely.from_wkb(r['geometry'])
+    if g.geom_type != 'Point':
+        continue
+    x, y = merc(g.x, g.y)
+    if kx0 <= x <= kx1 and ky0 <= y <= ky1:
+        pois.append((float(x), float(y)))
+out['pois'] = np.array(pois)
+print('pois', len(pois))
+
 with open('data/prepared.pkl', 'wb') as f:
     pickle.dump(out, f, protocol=pickle.HIGHEST_PROTOCOL)
 print('saved')
